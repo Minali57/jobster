@@ -1,0 +1,988 @@
+/* eslint-disable jsx-a11y/media-has-caption */
+import {
+  AttachmentPrimary,
+  SendPrimary,
+  UnderVerification,
+} from 'app/assets/images'
+import chatService from 'app/services/chat-service'
+import {
+  CHAT_RECORDS_LIMIT,
+  COMMA,
+  DEFAULT_ONE,
+  EMPTY_STRING,
+  ENTER_KEY_CODE,
+  INTERNAL_SERVER_ERR,
+  MEDIA_TYPE,
+  NUMBER,
+  SCROLL_BEHAVIOR,
+  SCROLL_BLOCK,
+  TIME_INTERVAL_30_IN_MILISECOND,
+} from 'app/utility/constants'
+import { TranslationNamespaces } from 'app/utility/enums/translation-namespaces'
+import {
+  getDateFormat,
+  getUniqueKey,
+  getUser,
+  hideLoaderForBatchApiCall,
+  showLoaderForBatchApiCall,
+} from 'app/utility/helper'
+import { getTimeString } from 'app/utility/helper/chat'
+import {
+  GetChatDetailsResponse,
+  IGetMessagesResponse,
+  IGetVerifiedAttachmentResponse,
+  ILastMessage,
+  ISingleConversationDetail,
+} from 'app/utility/interfaces/chat'
+import { WSConnectionType } from 'common-types/lib/constants/ws-message-types'
+import {
+  CameraPrimary,
+  MoreDefaultIcon,
+  PlayRoundWhite,
+} from 'common-ui/src/app/assets/images'
+import Avatar from 'common-ui/src/app/shared/components/Avatar'
+import DropDownMenu, {
+  IMenuItem,
+} from 'common-ui/src/app/shared/components/DropDownMenu'
+import IconButton from 'common-ui/src/app/shared/components/IconButton'
+import RenderContent from 'common-ui/src/app/shared/components/RenderContent'
+import Typography from 'common-ui/src/app/shared/components/Typography'
+import React, { useEffect, useCallback, useState, useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
+import Dialog from 'common-ui/src/app/shared/components/Dialog'
+import Button from 'common-ui/src/app/shared/components/Button'
+import { IDropZoneFile } from 'common-ui/src/app/shared/components/FormHooks/RFHDropZone'
+import { AxiosResponse } from 'axios'
+import {
+  getS3PresignedParams,
+  IPreSignFields,
+  ISuccessResponse,
+  uploadFileToBucket,
+} from 'common-ui/src/app/services/bucket-service'
+import { S3MimeTypes } from 'common-ui/src/app/utility/enums/common'
+import { PRESIGN_URL_PREFIX } from 'app/configs'
+import { DEFAULT_NUMERIC_VALUE } from 'common-ui/src/app/utility/constants'
+import { FileAttachmentTypeConstants } from 'common-types/lib/constants/customer-service-cart-constants'
+import { makeStyles } from '@material-ui/core'
+import useToggle from 'app/hooks/useToggle'
+import uniq from 'lodash/uniq'
+import { ChatOptions, WebSocketConnection } from 'app/utility/enums/chat'
+import useToast from 'app/hooks/useToast'
+import { useHistory } from 'react-router-dom'
+import { AppRoutings } from 'app/utility/enums/app-routings'
+import { OrderStatus } from 'common-types/lib/constants/order-status'
+import { UserTypes } from 'common-types/lib/constants/user-types'
+import CameraControl from 'common-ui/src/app/shared/components/CameraControl'
+import useKeepScrollPosition from 'common-ui/src/app/hooks/useKeepScroll'
+import useOnScreen from 'common-ui/src/app/hooks/useOnScreen'
+import { OrderChatMessageMaxLength } from 'common-types/lib/constants/validation-constants'
+import useSocket from 'app/hooks/useSocket'
+import ChatAttachments from '../ChatAttachments'
+
+interface IProps {
+  orderId?: number
+  isFromChatListingPage?: boolean
+  setLastMessage?: React.Dispatch<React.SetStateAction<ILastMessage>>
+  setOpenChatBox?: React.Dispatch<React.SetStateAction<boolean>>
+  activeConversation?: ISingleConversationDetail
+  setActiveConversation?: React.Dispatch<
+    React.SetStateAction<ISingleConversationDetail>
+  >
+  chatRef?: React.MutableRefObject<HTMLDivElement>
+}
+
+const CHAT_FOLDER = 'order_chat_attachments'
+
+const OrderStatusForChat = [
+  OrderStatus.Confirmed,
+  OrderStatus.ConfirmedWithChange,
+  OrderStatus.ProviderEnRoute,
+  OrderStatus.ChangeOrderInProgress,
+  OrderStatus.InProgress,
+  OrderStatus.DeliveredPendingPayment,
+  OrderStatus.DeliveryOnHold,
+  OrderStatus.DeliveryResumed,
+  OrderStatus.Disputed,
+]
+
+const useStyles = makeStyles(() => ({
+  PreviewImage: {
+    display: 'block',
+    maxWidth: '100%',
+    height: 'auto',
+    width: 'auto',
+    '& .MuiAvatar-img': {
+      maxWidth: '100%',
+    },
+  },
+  VideoPreview: {
+    display: 'block',
+    maxWidth: '100%',
+    height: 'auto',
+    width: '100%',
+  },
+  DropzonePreviewListImage: {
+    width: 48,
+    height: 48,
+    boxShadow: 'none',
+    maxWidth: '100%',
+  },
+}))
+
+const ChatDetails: React.FC<IProps> = ({
+  isFromChatListingPage,
+  orderId,
+  setOpenChatBox,
+  activeConversation,
+  setActiveConversation,
+  setLastMessage,
+  chatRef,
+}) => {
+  const { t: chatT } = useTranslation(TranslationNamespaces.Chat)
+  const { t: validationsT } = useTranslation(TranslationNamespaces.Validations)
+  const { t } = useTranslation(TranslationNamespaces.Translation)
+  const [message, setMessage] = useState(EMPTY_STRING)
+  const user = getUser()
+  const classes = useStyles()
+  const [chatDetails, setChatDetails] = useState<GetChatDetailsResponse>()
+  const [loading, setLoading] = useState(false)
+  const [addAttachments, setAddAttachments] = useState(false)
+  const [isPreviewOpen, togglePreview] = useToggle(false)
+  const [previewItem, setPreviewItem] =
+    useState<IGetVerifiedAttachmentResponse>(null)
+  const { errorToast } = useToast()
+  const history = useHistory()
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const [msgId, setMsgId] = useState<number>()
+  const { containerRef } = useKeepScrollPosition([chatDetails?.orderChats])
+  const [lastMessageRef, setLastMessageRef] = useState(null)
+  const isIntersecting = useOnScreen({ current: lastMessageRef })
+  const [hasMore, setHasMore] = useState(true)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [openWebCam, setOpenWebCam] = useState(false)
+  const [isLimitExceeded, setIsLimitExceeded] = useState(false)
+  const {
+    webSocketConnection,
+    closeConnection,
+    webSocketRef: webSocketChats,
+  } = useSocket()
+
+  const scrollToBottom = useCallback(() => {
+    const currTarget = containerRef?.current
+    if (currTarget) currTarget.scrollTop = currTarget.scrollHeight
+  }, [containerRef])
+
+  const isNotChatListingPageOrIsActiveChatNotOffensive = useCallback(
+    (isFromListing, receivedData, activeChat) =>
+      receivedData?.message !== INTERNAL_SERVER_ERR &&
+      !receivedData?.isOffensiveContent &&
+      ((!isFromListing && orderId === receivedData?.orderId) ||
+        activeChat === receivedData?.orderId),
+    [orderId]
+  )
+
+  const onMessageReceived = useCallback(
+    (receivedData) => {
+      if (receivedData?.userType === UserTypes.Admin) {
+        setChatDetails((prev) => {
+          const isAdminAdded = prev.orderChatUsers?.find(
+            (record) => record.userId === receivedData?.messageBy
+          )
+          return {
+            ...prev,
+            orderChatUsers: isAdminAdded?.userId
+              ? prev.orderChatUsers
+              : [
+                  ...prev.orderChatUsers,
+                  {
+                    user: { userType: UserTypes.Admin },
+                    userId: receivedData?.messageBy,
+                  },
+                ],
+          }
+        })
+      }
+      if (receivedData?.monitorChatsEnable) {
+        setChatDetails((prev) => ({
+          ...prev,
+          orderChatUsers: [
+            ...prev.orderChatUsers,
+            {
+              user: { userType: UserTypes.Admin },
+              userId: receivedData?.userId,
+            },
+          ],
+        }))
+        return
+      }
+      if (receivedData?.monitorChatsEnable === false) {
+        setChatDetails((prev) => ({
+          ...prev,
+          orderChatUsers: prev.orderChatUsers.filter(
+            (record) => record.userId !== receivedData?.userId
+          ),
+        }))
+        return
+      }
+      if (receivedData?.isOffensiveContent) {
+        let removeMsgId: number
+        setMsgId((prev) => {
+          removeMsgId = prev
+          return prev
+        })
+        errorToast(receivedData?.message)
+        setChatDetails((prev) => ({
+          ...prev,
+          orderChats: prev.orderChats.filter(
+            (record) => record.id !== removeMsgId
+          ),
+        }))
+        let currOrderId: number
+        let lastMsg: string
+        setChatDetails((prev) => {
+          lastMsg = prev?.orderChats[prev.orderChats.length - 1]?.message
+          currOrderId = prev?.orderChats[prev.orderChats.length - 1]?.orderId
+          return prev
+        })
+        const lastMessage = { orderId: currOrderId, message: lastMsg }
+        if (lastMessage?.orderId) setLastMessage?.(lastMessage)
+      }
+      let activeChat: number
+      setActiveConversation?.((prev) => {
+        activeChat = prev?.orderId
+        return prev
+      })
+      if (
+        isNotChatListingPageOrIsActiveChatNotOffensive(
+          isFromChatListingPage,
+          receivedData,
+          activeChat
+        )
+      ) {
+        setChatDetails((prev) => ({
+          ...prev,
+          orderChats: [...prev.orderChats, receivedData],
+        }))
+        scrollToBottom()
+      }
+    },
+    [
+      errorToast,
+      isFromChatListingPage,
+      isNotChatListingPageOrIsActiveChatNotOffensive,
+      scrollToBottom,
+      setActiveConversation,
+      setLastMessage,
+    ]
+  )
+
+  const videoPreview = previewItem?.isVerified ? (
+    <video className={classes.VideoPreview} controls>
+      <source src={previewItem?.attachmentUrl} />
+    </video>
+  ) : (
+    <Avatar
+      className={classes.PreviewImage}
+      variant="square"
+      src={UnderVerification}
+    />
+  )
+
+  const previewDialogContent =
+    previewItem?.attachmentType === FileAttachmentTypeConstants.Video ? (
+      videoPreview
+    ) : (
+      <Avatar
+        className={classes.PreviewImage}
+        variant="square"
+        src={
+          previewItem?.isVerified
+            ? previewItem?.attachmentUrl
+            : UnderVerification
+        }
+      />
+    )
+
+  const previewDialogAction = (
+    <Button
+      className="d-block mx-auto w-auto"
+      variant="contained"
+      color="primary"
+      size="large"
+      id="preview-okay-btn"
+      title={t('okay')}
+      onClick={() => togglePreview()}
+    >
+      {t('okay')}
+    </Button>
+  )
+
+  const getConversations = useCallback(
+    async (offset?: number, prepend?: boolean) => {
+      if (orderId) {
+        const payload = {
+          orderId,
+          limit: CHAT_RECORDS_LIMIT,
+          offset,
+        }
+        try {
+          const {
+            data: { data: chatDetail },
+          } = await chatService.getMessages(payload)
+          if (prepend) {
+            setChatDetails((prev) => ({
+              ...prev,
+              orderChats: [...chatDetail?.orderChats, ...prev?.orderChats],
+            }))
+          } else {
+            setChatDetails(chatDetail)
+
+            scrollToBottom()
+          }
+          setHasMore(!!chatDetail?.orderChats?.length)
+        } catch (e) {
+          setLoading(false)
+        }
+      }
+    },
+    [orderId, scrollToBottom]
+  )
+  useEffect(() => {
+    ;(async () => {
+      if (isIntersecting) {
+        await getConversations(chatDetails?.orderChats?.length, true)
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isIntersecting])
+
+  useEffect(() => {
+    ;(async () => {
+      await webSocketConnection({
+        wsConnectionType: WSConnectionType.Chat,
+        onSocketMessage: onMessageReceived,
+      })
+    })()
+    return () => {
+      closeConnection()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    ;(async () => {
+      if (!isFromChatListingPage) {
+        chatRef.current?.scrollIntoView({
+          behavior: SCROLL_BEHAVIOR,
+          block: SCROLL_BLOCK,
+        })
+      }
+      setLoading(true)
+      await getConversations()
+      setLoading(false)
+      scrollToBottom()
+      webSocketChats.current?.send(
+        JSON.stringify({
+          action: WebSocketConnection.ManageChat,
+          data: {
+            unreadCountUpdated: true,
+            orderId,
+            userId: user.userId,
+            unreadCount: DEFAULT_NUMERIC_VALUE,
+          },
+        })
+      )
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderId])
+
+  const getVerifiedImages = useCallback(async () => {
+    const ids = [] as number[]
+    if (chatDetails) {
+      setChatDetails((prev) => {
+        return {
+          ...prev,
+          orderChats: prev.orderChats.map((msgRecord) => {
+            return {
+              ...msgRecord,
+              orderChatAttachments: msgRecord.orderChatAttachments?.map(
+                (attchRecord) => {
+                  if (!attchRecord.isVerified) {
+                    ids.push(attchRecord.id)
+                    return {
+                      ...attchRecord,
+                    }
+                  }
+                  return { ...attchRecord }
+                }
+              ),
+            }
+          }),
+        }
+      })
+    }
+    const payload = { ids: uniq(ids) }
+    if (payload?.ids?.length) {
+      const {
+        data: { data },
+      } = await chatService.getVerifiedChatAttachments(payload)
+      setChatDetails((prev) => {
+        return {
+          ...prev,
+          orderChats: prev.orderChats.map((msgRecord) => {
+            return {
+              ...msgRecord,
+              orderChatAttachments: msgRecord.orderChatAttachments?.map(
+                (attchRecord) => {
+                  data.forEach((resRecord) => {
+                    if (resRecord.id === attchRecord.id) {
+                      attchRecord.isVerified = resRecord.isVerified
+                      attchRecord.attachmentUrl = resRecord.attachmentUrl
+                    }
+                  })
+
+                  return { ...attchRecord }
+                }
+              ),
+            }
+          }),
+        }
+      })
+    }
+  }, [chatDetails])
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      getVerifiedImages()
+    }, TIME_INTERVAL_30_IN_MILISECOND)
+
+    return () => {
+      clearInterval(interval)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const chatMenu: IMenuItem[] = useMemo(
+    () => [
+      {
+        children: chatT('export_chats'),
+        disabled: false,
+        value: ChatOptions.ExportChat,
+      },
+      {
+        children: chatT('go_to_chats'),
+        disabled: false,
+        value: ChatOptions.GoToChats,
+      },
+      {
+        children: chatT('close'),
+        disabled: false,
+        value: ChatOptions.CloseChat,
+      },
+    ],
+    [chatT]
+  )
+
+  const sendMessage = useCallback(
+    async (
+      files?: Array<IDropZoneFile>,
+      e?: React.FormEvent<HTMLFormElement>
+    ) => {
+      e?.preventDefault()
+      const chatAttachments: Array<{
+        attachmentUrl: string
+        attachmentType: number
+        fileUrl?: string
+      }> = []
+      if (files?.length) {
+        const imagesWithFile = files?.filter(
+          (record) =>
+            record.file !== null &&
+            record?.file?.type?.includes(MEDIA_TYPE.Image)
+        )
+        const videosWithFile = files?.filter(
+          (record) =>
+            record.file !== null &&
+            record?.file?.type?.includes(MEDIA_TYPE.Video)
+        )
+        const filesWithUniqueIds = [...imagesWithFile, ...videosWithFile].map(
+          (file) => ({
+            uniqueId: `${CHAT_FOLDER}/${getUniqueKey()}_${file.file.name}`,
+            fileContainer: file.file,
+          })
+        )
+        showLoaderForBatchApiCall()
+        const preSignedItemContainer: Array<
+          Promise<AxiosResponse<ISuccessResponse<IPreSignFields>>>
+        > = []
+        if (imagesWithFile?.length) {
+          preSignedItemContainer.push(
+            getS3PresignedParams(PRESIGN_URL_PREFIX, {
+              mimeType: S3MimeTypes.GENERAL_IMAGE,
+              keyStartWith: CHAT_FOLDER,
+            })
+          )
+        }
+        if (videosWithFile?.length) {
+          preSignedItemContainer.push(
+            getS3PresignedParams(PRESIGN_URL_PREFIX, {
+              mimeType: S3MimeTypes.GENERAL_VIDEO,
+              keyStartWith: CHAT_FOLDER,
+            })
+          )
+        }
+        const result = await Promise.all([...preSignedItemContainer])
+        const promiseContainer: Array<Promise<AxiosResponse>> = []
+
+        filesWithUniqueIds.forEach((fileObject) => {
+          let arrayIndex = fileObject?.fileContainer?.type?.includes(
+            MEDIA_TYPE.Video
+          )
+            ? DEFAULT_ONE
+            : DEFAULT_NUMERIC_VALUE
+          if (preSignedItemContainer?.length === DEFAULT_ONE) {
+            arrayIndex = DEFAULT_NUMERIC_VALUE
+          }
+          const { url: bucketUrl, fields } = result?.[arrayIndex]?.data?.data
+          const form = new FormData()
+          const payload = {
+            key: fileObject?.uniqueId,
+            ...fields,
+            'Content-Type': fileObject?.fileContainer.type,
+            file: fileObject?.fileContainer,
+          }
+          Object.keys(payload).forEach((property) =>
+            form.append(property, payload[property as keyof typeof payload])
+          )
+          promiseContainer.push(uploadFileToBucket(bucketUrl, form))
+        })
+        await Promise.allSettled([...promiseContainer])
+        filesWithUniqueIds.forEach((file) => {
+          chatAttachments.push({
+            attachmentUrl: file.uniqueId.replace(
+              `${CHAT_FOLDER}/`,
+              EMPTY_STRING
+            ),
+            attachmentType: file.fileContainer.type.includes(MEDIA_TYPE.Video)
+              ? FileAttachmentTypeConstants.Video
+              : FileAttachmentTypeConstants.Image,
+          })
+        })
+        hideLoaderForBatchApiCall()
+      }
+      const currMsgId = Math.random()
+      setMsgId(currMsgId)
+      const adminIds = chatDetails?.orderChatUsers
+        .filter((record) => record.user.userType === UserTypes.Admin)
+        ?.map((record) => record.userId)
+      const providerIds = chatDetails?.provider
+        ?.filter((record) => record.userId !== user.userId)
+        .map((record) => record.userId)
+      const currMsg: IGetMessagesResponse = {
+        message,
+        messageBy: user.userId,
+        messageByName: `${user.firstName} ${user.lastName}`,
+        messageTo: adminIds?.length
+          ? [chatDetails?.customer?.userId, ...adminIds, ...providerIds]
+          : [chatDetails?.customer?.userId, ...providerIds],
+        orderId,
+        createDate: new Date().toISOString(),
+        unreadCount: chatAttachments?.length
+          ? chatAttachments?.length
+          : NUMBER.ONE,
+        orderChatAttachments: chatAttachments,
+      }
+      if (message || currMsg?.orderChatAttachments?.length) {
+        webSocketChats.current.send(
+          JSON.stringify({
+            action: WebSocketConnection.ManageChat,
+            data: currMsg,
+          })
+        )
+        setChatDetails((prev) => ({
+          ...prev,
+          orderChats: [
+            ...prev.orderChats,
+            {
+              ...currMsg,
+              id: currMsgId,
+              orderChatAttachments: files?.map((record) => ({
+                attachmentUrl: record.previewUrl,
+                isVerified: true,
+                attachmentType: record?.file?.type?.includes(MEDIA_TYPE.Image)
+                  ? FileAttachmentTypeConstants.Image
+                  : FileAttachmentTypeConstants.Video,
+              })),
+            },
+          ],
+        }))
+        scrollToBottom()
+        const lastMessage = {
+          orderId: currMsg.orderId,
+          message: currMsg.message,
+        }
+        setLastMessage?.(lastMessage)
+      }
+
+      setMessage(EMPTY_STRING)
+      setIsLimitExceeded(false)
+    },
+    [
+      chatDetails?.customer?.userId,
+      chatDetails?.orderChatUsers,
+      chatDetails?.provider,
+      message,
+      orderId,
+      scrollToBottom,
+      setLastMessage,
+      user.firstName,
+      user.lastName,
+      user.userId,
+      webSocketChats,
+    ]
+  )
+
+  const handleInputChange = useCallback(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (e: any) => {
+      if (e.target.value.length <= OrderChatMessageMaxLength) {
+        const currMsg = e.target.value.trim() ? e.target.value : EMPTY_STRING
+        setMessage(currMsg)
+      } else if (
+        !isLimitExceeded &&
+        e.target.value.length > OrderChatMessageMaxLength
+      ) {
+        errorToast(
+          `${validationsT(
+            'maximum'
+          )} ${OrderChatMessageMaxLength} ${validationsT('characters_allowed')}`
+        )
+        setIsLimitExceeded(true)
+      }
+      if (isLimitExceeded && e.target.value.length <= OrderChatMessageMaxLength)
+        setIsLimitExceeded(false)
+    },
+    [errorToast, isLimitExceeded, validationsT]
+  )
+
+  const exportChats = useCallback(async () => {
+    try {
+      const payload = { orderId }
+      await chatService.exportChats(payload)
+    } catch (e) {
+      errorToast(e.response.data[0].messages[0])
+    }
+  }, [errorToast, orderId])
+
+  const handleChatMenuSelection = useCallback(
+    (val: number | string) => {
+      switch (+val) {
+        case ChatOptions.CloseChat:
+          setOpenChatBox(false)
+          break
+        case ChatOptions.ExportChat:
+          exportChats()
+          break
+        case ChatOptions.GoToChats:
+          history.push(AppRoutings.Chat)
+          break
+        default:
+          break
+      }
+    },
+    [exportChats, history, setOpenChatBox]
+  )
+
+  const getProviderNames = useCallback(() => {
+    const filteredData = chatDetails?.provider?.filter(
+      (singleProvider) => singleProvider.userId !== user?.userId
+    )
+    let updatedName = EMPTY_STRING
+    filteredData?.forEach((singleProvider, index) => {
+      updatedName += `${singleProvider?.firstName} ${singleProvider?.lastName}${
+        index !== filteredData?.length - NUMBER.ONE ? `${COMMA} ` : EMPTY_STRING
+      }`
+    })
+    return updatedName
+  }, [chatDetails?.provider, user?.userId])
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleKeyDown = (e: any) => {
+    if (e.keyCode === ENTER_KEY_CODE) {
+      if (!e.shiftKey) {
+        e.preventDefault()
+        sendMessage([])
+      }
+    }
+  }
+
+  return (
+    <React.Fragment key="c-1">
+      <div
+        className={`inline-chatbox ${
+          isFromChatListingPage ? EMPTY_STRING : 'my-2 mb-4'
+        } ${!chatDetails?.id ? 'pt-64' : EMPTY_STRING}`}
+        ref={chatRef}
+      >
+        {chatDetails?.id && (
+          <div className="inline-chatbox-header">
+            <Typography variant="body1" className="fw-600 username">
+              {activeConversation?.name ||
+                (chatDetails?.customer?.firstName
+                  ? `${chatDetails?.customer?.firstName} ${
+                      chatDetails?.customer?.lastName
+                    }${
+                      getProviderNames()?.length ? COMMA : EMPTY_STRING
+                    } ${getProviderNames()}`
+                  : t('loading'))}
+              <span className="d-block fw-400 font-16 pt-4px orderid">
+                {chatT('order_id')}:{' '}
+                {activeConversation?.orderNumber || chatDetails?.number}
+              </span>
+            </Typography>
+            {!isFromChatListingPage && (
+              <DropDownMenu
+                color="default"
+                variant="text"
+                id="chat-option"
+                buttonType="icon"
+                menuItems={chatMenu}
+                placement="bottom-end"
+                onChange={handleChatMenuSelection}
+              >
+                <Avatar src={MoreDefaultIcon} size={20} />
+              </DropDownMenu>
+            )}
+          </div>
+        )}
+        <div className="inline-chatbox-body" ref={containerRef}>
+          <RenderContent isLoading={loading}>
+            <ul className="chat">
+              {chatDetails?.orderChats?.map((record, index) => (
+                <React.Fragment key={`${record.createDate}-${index + 1}`}>
+                  {index === DEFAULT_NUMERIC_VALUE && hasMore && (
+                    <div ref={(ref) => setLastMessageRef(ref)} />
+                  )}
+                  {index > DEFAULT_NUMERIC_VALUE &&
+                    getDateFormat(record.createDate || new Date()) !==
+                      getDateFormat(
+                        chatDetails?.orderChats[index - 1].createDate ||
+                          new Date()
+                      ) && (
+                      <li
+                        className="day-date"
+                        // eslint-disable-next-line react/no-array-index-key
+                        // key={`${record.createDate}-${index}`}
+                      >
+                        <span className="day-date-data">
+                          {getDateFormat(record.createDate || new Date())}
+                        </span>
+                      </li>
+                    )}
+                  {index === DEFAULT_NUMERIC_VALUE && (
+                    <li
+                      className="day-date"
+                      // eslint-disable-next-line react/no-array-index-key
+                      key={`${record.createDate}-${index}`}
+                    >
+                      <span className="day-date-data">
+                        {getDateFormat(record.createDate || new Date())}
+                      </span>
+                    </li>
+                  )}
+                  {!!record.orderChatAttachments?.length &&
+                    record?.orderChatAttachments?.map((attchRecord, ind) => (
+                      <li
+                        className={
+                          record?.messageBy === user.userId
+                            ? 'sender'
+                            : 'reciever'
+                        }
+                        // eslint-disable-next-line react/no-array-index-key
+                        key={`${record.createDate}-attachment-${ind}`}
+                      >
+                        <div className="chat-message media-box">
+                          <IconButton
+                            onClick={() => {
+                              setPreviewItem(attchRecord)
+                              togglePreview()
+                            }}
+                            color="default"
+                            variant="text"
+                            className="p-0 item-wrapper"
+                          >
+                            {' '}
+                            {attchRecord?.attachmentType ===
+                              FileAttachmentTypeConstants.Video &&
+                            !!attchRecord?.attachmentUrl ? (
+                              <>
+                                {attchRecord?.isVerified ? (
+                                  <>
+                                    <Avatar
+                                      className="play-btn"
+                                      size={18}
+                                      variant="rounded"
+                                      src={PlayRoundWhite}
+                                    />
+                                    <video
+                                      style={{ width: '77px', height: '77px' }}
+                                      className={
+                                        classes.DropzonePreviewListImage
+                                      }
+                                      src={attchRecord?.attachmentUrl}
+                                    />
+                                  </>
+                                ) : (
+                                  <Avatar
+                                    src={UnderVerification}
+                                    variant="rounded"
+                                    size={77}
+                                  />
+                                )}
+                              </>
+                            ) : (
+                              <Avatar
+                                src={
+                                  attchRecord?.isVerified
+                                    ? attchRecord?.attachmentUrl
+                                    : UnderVerification
+                                }
+                                variant="rounded"
+                                size={77}
+                              />
+                            )}
+                          </IconButton>
+                        </div>
+                        <Typography variant="caption" className="message-time">
+                          {record?.messageBy !== user.userId && (
+                            <b className="d-inline-block fw-600 mr-4px">
+                              {record?.messageByName},
+                            </b>
+                          )}
+                          {getTimeString(record?.createDate || new Date())}
+                        </Typography>
+                      </li>
+                    ))}
+                  {!record.orderChatAttachments?.length && (
+                    <li
+                      className={
+                        record?.messageBy === user.userId
+                          ? 'sender'
+                          : 'reciever'
+                      }
+                      // eslint-disable-next-line react/no-array-index-key
+                      key={`${record.createDate}-orderattach-${index}`}
+                    >
+                      <div
+                        className="chat-message"
+                        style={{ whiteSpace: 'pre-line' }}
+                      >
+                        {record?.message}
+                      </div>
+
+                      <Typography variant="caption" className="message-time">
+                        {record?.messageBy !== user.userId && (
+                          <b className="d-inline-block fw-600 mr-4px">
+                            {record?.messageByName},
+                          </b>
+                        )}
+                        {getTimeString(record?.createDate || new Date())}
+                      </Typography>
+                    </li>
+                  )}
+                </React.Fragment>
+              ))}
+            </ul>
+          </RenderContent>
+        </div>
+        {OrderStatusForChat.includes(chatDetails?.status) && (
+          <div className="action-bar inline-chatbox-footer">
+            <form onSubmit={(e) => sendMessage([], e)}>
+              <div className="reply-box">
+                <textarea
+                  className="reply-input"
+                  style={{ resize: 'none' }}
+                  rows={2}
+                  placeholder={chatT('reply_here')}
+                  onKeyDown={handleKeyDown}
+                  value={message}
+                  onChange={handleInputChange}
+                />
+                <IconButton
+                  className="btn-send"
+                  color="primary"
+                  variant="text"
+                  id="chat-send-btn"
+                  title={chatT('send')}
+                  disabled={!message}
+                  type="submit"
+                >
+                  <Avatar variant="square" src={SendPrimary} size={24} />
+                </IconButton>
+
+                <div className="right-action">
+                  <IconButton
+                    className="btn-attachment"
+                    color="primary"
+                    id="chat-attachment-btn"
+                    variant="text"
+                    title={chatT('add_attachments')}
+                    onClick={() => setAddAttachments(true)}
+                  >
+                    <Avatar
+                      variant="square"
+                      src={AttachmentPrimary}
+                      size={24}
+                    />
+                  </IconButton>
+
+                  <IconButton
+                    className="btn-camera"
+                    color="primary"
+                    variant="text"
+                    id="chat-camera-btn"
+                    title="Camera"
+                    onClick={() => {
+                      setModalOpen(true)
+                      setOpenWebCam(true)
+                    }}
+                  >
+                    <Avatar variant="square" src={CameraPrimary} size={24} />
+                  </IconButton>
+                </div>
+              </div>
+            </form>
+          </div>
+        )}
+      </div>
+      <ChatAttachments
+        open={addAttachments}
+        setIsOpen={setAddAttachments}
+        sendMessage={sendMessage}
+      />
+      <CameraControl
+        capturePhotoLabel={chatT('capture_photo')}
+        startRecordingLabel={chatT('start_capture')}
+        stopRecordingLabel={chatT('stop_capture')}
+        retakeLabel={chatT('retake')}
+        sendLabel={chatT('send')}
+        errorMessage={chatT('camera_control_not_found')}
+        dialogTitle={chatT('camera_control')}
+        modalOpen={modalOpen}
+        setModalOpen={setModalOpen}
+        openWebCam={openWebCam}
+        setOpenWebCam={setOpenWebCam}
+        sendMessage={sendMessage}
+      />
+      <Dialog
+        open={isPreviewOpen}
+        handleClose={togglePreview}
+        title={chatT('preview')}
+        dialogContent={previewDialogContent}
+        dialogActions={previewDialogAction}
+      />
+    </React.Fragment>
+  )
+}
+
+export default ChatDetails

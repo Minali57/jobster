@@ -1,24 +1,38 @@
-import logo from './logo.svg';
-import './App.css';
+import { Landing, Error, Register,ProtectedRoute } from "./pages";
+import { Routes, Route } from "react-router-dom";
+import { ToastContainer, toast } from "react-toastify";
+import "react-toastify/dist/ReactToastify.css";
+import {
+  Addjob,
+  Profile,
+  Alljobs,
+  Stats,
+  SharedLayout,
+} from "./pages/dashboard";
 
 function App() {
   return (
-    <div className="App">
-      <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
+    <>
+      <Routes>
+        <Route
+          path="/"
+          element={
+            <ProtectedRoute>
+              <SharedLayout />
+            </ProtectedRoute>
+          }
         >
-          Learn React
-        </a>
-      </header>
-    </div>
+          <Route index element={<Stats />} />
+          <Route path="all-jobs" element={<Alljobs />} />
+          <Route path="add-job" element={<Addjob />} />
+          <Route path="profile" element={<Profile />} />
+        </Route>
+        <Route path="landing" element={<Landing />} />
+        <Route path="register" element={<Register />} />
+        <Route path="*" element={<Error />} />
+      </Routes>
+      <ToastContainer position="top-center" />
+    </>
   );
 }
 
